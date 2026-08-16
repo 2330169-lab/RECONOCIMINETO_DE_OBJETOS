@@ -8,45 +8,187 @@
 
 
 import tensorflow as tf
-from tensorflow.keras import layers, Model
-from pathlib import Path
-import random
 import numpy as np
-import os
+import cv2
+import random
+
+from pathlib import Path
+
 
 # ============================================================
-# CONFIGURACION
+# CONFIGURACION GENERAL
 # ============================================================
 
 DATASET_DIR = Path("dataset")
-ARCHIVO_CLASES = Path("clases.txt")
+
+CARPETA_NEGATIVOS = "no_objeto"
+
+# Estas son las UNICAS clases reales.
+# no_objeto NO es una clase.
+CLASS_NAMES = [
+    "Bolsas",
+    "Peluches",
+    "Perfume"
+]
+
+NUM_CLASSES = len(CLASS_NAMES)
+
+# ------------------------------------------------------------
+# SALIDA DE LA RED
+# ------------------------------------------------------------
+#
+# x
+# y
+# w
+# h
+# objectness
+# Bolsas
+# Peluches
+# Perfume
+#
+# 4 + 1 + 3 = 8
+# ------------------------------------------------------------
+
+NUM_SALIDAS = 5 + NUM_CLASSES
+
+
+# ============================================================
+# CONFIGURACION DE ENTRENAMIENTO
+# ============================================================
 
 IMG_SIZE = (224, 224)
 
 BATCH_SIZE = 16
+
 EPOCHS = 150
-SEED = 123
 
 VALIDATION_SPLIT = 0.20
 
-# Peso que tendra el error del bounding box
-# respecto al error de clasificacion
-BBOX_LOSS_WEIGHT = 5.0
+SEED = 123
 
-# Extensiones permitidas
+
+# ============================================================
+# LEARNING RATE
+# ============================================================
+
+LEARNING_RATE = 0.00005
+
+
+# ============================================================
+# PESOS DE LAS PERDIDAS
+# ============================================================
+
+# Importancia de saber si realmente hay un objeto
+OBJECTNESS_LOSS_WEIGHT = 1.5
+
+# Importancia de clasificar correctamente
+CLASS_LOSS_WEIGHT = 1.0
+
+# Importancia del bounding box
+BBOX_LOSS_WEIGHT = 2.0
+
+
+# ============================================================
+# PESO EXTRA PARA OBJETOS POSITIVOS
+# ============================================================
+#
+# Esto ayuda a evitar que, por tener muchas imagenes
+# no_objeto, la red se vuelva demasiado conservadora.
+#
+# 1.5 significa que equivocarse diciendo "no hay objeto"
+# cuando SI existe uno tiene un poco mas de importancia.
+# ============================================================
+
+POSITIVE_OBJECTNESS_WEIGHT = 1.0
+
+
+# ============================================================
+# CONTROL DE NEGATIVOS
+# ============================================================
+#
+# Evitamos que no_objeto tenga muchas mas imagenes
+# que todas las clases positivas juntas.
+#
+# 1.0 = como maximo tantos negativos como positivos.
+# ============================================================
+
+MAX_NEGATIVE_RATIO = 1.5
+
+
+# ============================================================
+# ARCHIVOS GENERADOS
+# ============================================================
+
+MEJOR_MODELO = "mejor_detector_objectness.keras"
+
+MODELO_FINAL = "modelo_detector_objectness_final.keras"
+
+HISTORIAL_CSV = "historial_entrenamiento_objectness.csv"
+
+
+# ============================================================
+# EXTENSIONES
+# ============================================================
+
 EXTENSIONES = {
     ".jpg",
     ".jpeg",
     ".png",
+    ".bmp",
     ".JPG",
     ".JPEG",
-    ".PNG"
+    ".PNG",
+    ".BMP"
 }
 
-# Fijar semillas
+
+# ============================================================
+# EMPEZAR COMPLETAMENTE DESDE CERO
+# ============================================================
+
+# Limpia cualquier modelo que pudiera existir en memoria.
+# NO carga ningun archivo .keras.
+
+tf.keras.backend.clear_session()
+
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+
+
+print("\n============================================")
+print("ENTRENAMIENTO DESDE CERO")
+print("============================================")
+
+print("\nNO se cargara ningun modelo anterior.")
+print("La red sera creada con pesos nuevos.")
+
+
+# ============================================================
+# CREAR clases.txt CORRECTAMENTE
+# ============================================================
+
+with open(
+    "clases.txt",
+    "w",
+    encoding="utf-8"
+) as archivo:
+
+    for clase in CLASS_NAMES:
+        archivo.write(clase + "\n")
+
+
+print("\nclases.txt creado/corregido.")
+
+print("\nClases:")
+
+for i, clase in enumerate(CLASS_NAMES):
+    print(f"{i} -> {clase}")
+
+print("\nIMPORTANTE:")
+print(
+    f"'{CARPETA_NEGATIVOS}' NO es una clase."
+)
 
 
 # ============================================================
@@ -56,56 +198,8 @@ tf.random.set_seed(SEED)
 if not DATASET_DIR.exists():
 
     raise FileNotFoundError(
-        f"No se encontro la carpeta: {DATASET_DIR}"
+        f"No existe la carpeta {DATASET_DIR}"
     )
-
-if not ARCHIVO_CLASES.exists():
-
-    raise FileNotFoundError(
-        "No se encontro clases.txt. "
-        "Ejecuta primero crear_etiquetas.py"
-    )
-
-
-# ============================================================
-# LEER CLASES
-# ============================================================
-
-with open(
-    ARCHIVO_CLASES,
-    "r",
-    encoding="utf-8"
-) as archivo:
-
-    class_names = [
-        linea.strip()
-        for linea in archivo.readlines()
-        if linea.strip()
-    ]
-
-
-NUM_CLASSES = len(class_names)
-
-NUM_SALIDAS = 4 + NUM_CLASSES
-
-
-print("\n==========================================")
-print("CLASES")
-print("==========================================")
-
-for i, clase in enumerate(class_names):
-    print(f"{i} -> {clase}")
-
-print("\nNumero de clases:", NUM_CLASSES)
-print("Numero de salidas:", NUM_SALIDAS)
-
-print("\nFormato de salida:")
-
-print(
-    "[x, y, w, h, "
-    + ", ".join(class_names)
-    + "]"
-)
 
 
 # ============================================================
@@ -115,13 +209,13 @@ print(
 def leer_etiqueta(ruta_txt):
 
     """
-    Espera una etiqueta con formato:
+    Formato esperado:
 
     clase x_centro y_centro ancho alto
 
     Ejemplo:
 
-    2 0.500000 0.500000 0.300000 0.600000
+    2 0.500000 0.480000 0.250000 0.600000
     """
 
     with open(
@@ -137,31 +231,30 @@ def leer_etiqueta(ruta_txt):
         ]
 
 
-    # ========================================================
-    # ESTE MODELO SOLO MANEJA UN OBJETO POR IMAGEN
-    # ========================================================
-
     if len(lineas) == 0:
 
         raise ValueError(
             f"Etiqueta vacia: {ruta_txt}"
         )
 
+
+    # Este detector esta diseñado para
+    # un objeto principal por imagen.
+
     if len(lineas) > 1:
 
         raise ValueError(
-            f"{ruta_txt} tiene mas de un objeto. "
-            "Este modelo esta diseñado para "
-            "un objeto por imagen."
+            f"{ruta_txt} contiene mas de un objeto."
         )
 
 
     datos = lineas[0].split()
 
+
     if len(datos) != 5:
 
         raise ValueError(
-            f"Formato incorrecto en: {ruta_txt}"
+            f"Formato incorrecto: {ruta_txt}"
         )
 
 
@@ -173,24 +266,22 @@ def leer_etiqueta(ruta_txt):
     h = float(datos[4])
 
 
-    # ========================================================
-    # COMPROBAR CLASE
-    # ========================================================
+    # --------------------------------------------------------
+    # VALIDAR CLASE
+    # --------------------------------------------------------
 
     if clase_id < 0 or clase_id >= NUM_CLASSES:
 
         raise ValueError(
-            f"Clase {clase_id} invalida en {ruta_txt}"
+            f"Clase invalida {clase_id} en {ruta_txt}"
         )
 
 
-    # ========================================================
-    # COMPROBAR COORDENADAS
-    # ========================================================
+    # --------------------------------------------------------
+    # VALIDAR BOUNDING BOX
+    # --------------------------------------------------------
 
-    valores = [x, y, w, h]
-
-    for valor in valores:
+    for valor in [x, y, w, h]:
 
         if valor < 0.0 or valor > 1.0:
 
@@ -206,9 +297,9 @@ def leer_etiqueta(ruta_txt):
         )
 
 
-    # ========================================================
-    # CREAR ONE-HOT PARA LA CLASE
-    # ========================================================
+    # --------------------------------------------------------
+    # ONE-HOT DE CLASE
+    # --------------------------------------------------------
 
     clase_one_hot = np.zeros(
         NUM_CLASSES,
@@ -218,16 +309,29 @@ def leer_etiqueta(ruta_txt):
     clase_one_hot[clase_id] = 1.0
 
 
-    # ========================================================
-    # SALIDA
-    # ========================================================
-
-    # [x, y, w, h, clase0, clase1, clase2]
+    # --------------------------------------------------------
+    # ETIQUETA FINAL
+    # --------------------------------------------------------
+    #
+    # [x, y, w, h,
+    #  objectness,
+    #  clase0, clase1, clase2]
+    #
+    # Para una imagen positiva:
+    #
+    # objectness = 1
+    # --------------------------------------------------------
 
     etiqueta = np.concatenate(
         [
             np.array(
-                [x, y, w, h],
+                [
+                    x,
+                    y,
+                    w,
+                    h,
+                    1.0
+                ],
                 dtype=np.float32
             ),
 
@@ -240,10 +344,10 @@ def leer_etiqueta(ruta_txt):
 
 
 # ============================================================
-# BUSCAR IMAGENES Y ETIQUETAS
+# BUSCAR IMAGENES POSITIVAS
 # ============================================================
 
-muestras_por_clase = {
+positivos_por_clase = {
     i: []
     for i in range(NUM_CLASSES)
 }
@@ -252,22 +356,26 @@ muestras_por_clase = {
 errores = 0
 
 
-print("\n==========================================")
-print("BUSCANDO IMAGENES ETIQUETADAS")
-print("==========================================\n")
+print("\n============================================")
+print("BUSCANDO OBJETOS ETIQUETADOS")
+print("============================================")
 
 
-for clase_id, nombre_clase in enumerate(class_names):
+for clase_id, nombre_clase in enumerate(
+    CLASS_NAMES
+):
 
-    carpeta = DATASET_DIR / nombre_clase
+    carpeta = (
+        DATASET_DIR /
+        nombre_clase
+    )
+
 
     if not carpeta.exists():
 
-        print(
-            f"ADVERTENCIA: No existe {carpeta}"
+        raise FileNotFoundError(
+            f"No existe: {carpeta}"
         )
-
-        continue
 
 
     for ruta_imagen in carpeta.iterdir():
@@ -276,17 +384,19 @@ for clase_id, nombre_clase in enumerate(class_names):
             continue
 
 
-        ruta_txt = ruta_imagen.with_suffix(".txt")
+        ruta_txt = ruta_imagen.with_suffix(
+            ".txt"
+        )
 
 
-        # ====================================================
-        # SOLO USAR IMAGENES CON ETIQUETA
-        # ====================================================
+        # ----------------------------------------------------
+        # NECESITA TXT
+        # ----------------------------------------------------
 
         if not ruta_txt.exists():
 
             print(
-                f"Sin etiqueta: {ruta_imagen.name}"
+                f"Sin etiqueta: {ruta_imagen}"
             )
 
             continue
@@ -299,10 +409,6 @@ for clase_id, nombre_clase in enumerate(class_names):
             )
 
 
-            # =================================================
-            # COMPROBAR QUE CARPETA Y TXT COINCIDAN
-            # =================================================
-
             if clase_txt != clase_id:
 
                 print(
@@ -310,16 +416,15 @@ for clase_id, nombre_clase in enumerate(class_names):
                 )
 
                 print(
-                    f"  Carpeta indica: {nombre_clase}"
+                    f"Carpeta: {nombre_clase}"
                 )
 
                 print(
-                    f"  TXT indica: "
-                    f"{class_names[clase_txt]}"
+                    f"TXT: {CLASS_NAMES[clase_txt]}"
                 )
 
 
-            muestras_por_clase[
+            positivos_por_clase[
                 clase_txt
             ].append(
                 (
@@ -332,76 +437,204 @@ for clase_id, nombre_clase in enumerate(class_names):
         except Exception as e:
 
             print(
-                f"ERROR en {ruta_imagen.name}: {e}"
+                f"ERROR: {ruta_imagen.name}"
             )
+
+            print(e)
 
             errores += 1
 
 
 # ============================================================
-# MOSTRAR CANTIDAD DE IMAGENES
+# MOSTRAR POSITIVOS
 # ============================================================
 
-print("\n==========================================")
-print("IMAGENES VALIDAS")
-print("==========================================")
+print("\n============================================")
+print("IMAGENES POSITIVAS")
+print("============================================")
 
-total_imagenes = 0
 
-for clase_id, nombre in enumerate(class_names):
+total_positivos = 0
+
+
+for clase_id, nombre in enumerate(
+    CLASS_NAMES
+):
 
     cantidad = len(
-        muestras_por_clase[clase_id]
+        positivos_por_clase[
+            clase_id
+        ]
     )
 
-    total_imagenes += cantidad
+    total_positivos += cantidad
 
     print(
         f"{nombre}: {cantidad}"
     )
 
 
-print("\nTotal:", total_imagenes)
-print("Errores:", errores)
+print(
+    f"\nTotal positivos: {total_positivos}"
+)
 
 
-if total_imagenes == 0:
+if total_positivos == 0:
 
     raise RuntimeError(
-        "No se encontraron imagenes etiquetadas."
+        "No se encontraron imagenes positivas."
     )
+
+
+# ============================================================
+# BUSCAR IMAGENES NEGATIVAS
+# ============================================================
+
+carpeta_negativos = (
+    DATASET_DIR /
+    CARPETA_NEGATIVOS
+)
+
+
+if not carpeta_negativos.exists():
+
+    raise FileNotFoundError(
+        f"No existe la carpeta "
+        f"{carpeta_negativos}"
+    )
+
+
+negativos = []
+
+
+print("\n============================================")
+print("BUSCANDO IMAGENES NO_OBJETO")
+print("============================================")
+
+
+for ruta_imagen in carpeta_negativos.iterdir():
+
+    if ruta_imagen.suffix not in EXTENSIONES:
+        continue
+
+
+    # --------------------------------------------------------
+    # ETIQUETA NEGATIVA
+    # --------------------------------------------------------
+    #
+    # bbox = 0,0,0,0
+    # objectness = 0
+    # clases = 0,0,0
+    #
+    # La funcion loss ignorara bbox y clases
+    # cuando objectness sea 0.
+    # --------------------------------------------------------
+
+    etiqueta = np.zeros(
+        NUM_SALIDAS,
+        dtype=np.float32
+    )
+
+
+    negativos.append(
+        (
+            str(ruta_imagen),
+            etiqueta
+        )
+    )
+
+
+print(
+    f"Imagenes no_objeto encontradas: "
+    f"{len(negativos)}"
+)
+
+
+if len(negativos) == 0:
+
+    raise RuntimeError(
+        "La carpeta no_objeto esta vacia."
+    )
+
+
+# ============================================================
+# LIMITAR NEGATIVOS SI HAY DEMASIADOS
+# ============================================================
+
+max_negativos = int(
+    total_positivos
+    *
+    MAX_NEGATIVE_RATIO
+)
+
+
+if len(negativos) > max_negativos:
+
+    print(
+        "\nHay mas negativos de los necesarios."
+    )
+
+    print(
+        f"Se utilizaran {max_negativos} "
+        f"de {len(negativos)}."
+    )
+
+    random.Random(
+        SEED
+    ).shuffle(
+        negativos
+    )
+
+    negativos = negativos[
+        :max_negativos
+    ]
+
+
+print(
+    f"Negativos utilizados: {len(negativos)}"
+)
 
 
 # ============================================================
 # DIVIDIR TRAIN / VALIDATION
 # ============================================================
 
-# Hacemos la division por clase para evitar que
-# accidentalmente una clase quede fuera de validacion.
-
 train_samples = []
+
 val_samples = []
 
 
-for clase_id in range(NUM_CLASSES):
+# ============================================================
+# DIVIDIR POSITIVOS POR CLASE
+# ============================================================
 
-    muestras = muestras_por_clase[
+for clase_id in range(
+    NUM_CLASSES
+):
+
+    muestras = positivos_por_clase[
         clase_id
     ].copy()
 
+
     random.Random(
         SEED + clase_id
-    ).shuffle(muestras)
+    ).shuffle(
+        muestras
+    )
 
 
-    cantidad = len(muestras)
+    cantidad = len(
+        muestras
+    )
 
 
     if cantidad < 2:
 
         raise RuntimeError(
-            f"La clase '{class_names[clase_id]}' "
-            "necesita por lo menos 2 imagenes."
+            f"La clase "
+            f"{CLASS_NAMES[clase_id]} "
+            f"necesita mas imagenes."
         )
 
 
@@ -409,96 +642,241 @@ for clase_id in range(NUM_CLASSES):
         1,
         int(
             round(
-                cantidad * VALIDATION_SPLIT
+                cantidad
+                *
+                VALIDATION_SPLIT
             )
         )
     )
 
 
-    # Evitar mandar todas a validacion
     cantidad_val = min(
         cantidad_val,
         cantidad - 1
     )
 
 
-    val_clase = muestras[
-        :cantidad_val
-    ]
-
-    train_clase = muestras[
-        cantidad_val:
-    ]
-
-
     val_samples.extend(
-        val_clase
+        muestras[
+            :cantidad_val
+        ]
     )
+
 
     train_samples.extend(
-        train_clase
+        muestras[
+            cantidad_val:
+        ]
     )
 
 
-# Mezclar
-random.Random(SEED).shuffle(
+# ============================================================
+# DIVIDIR NEGATIVOS
+# ============================================================
+
+random.Random(
+    SEED + 100
+).shuffle(
+    negativos
+)
+
+
+cantidad_negativos = len(
+    negativos
+)
+
+
+cantidad_val_neg = max(
+    1,
+    int(
+        round(
+            cantidad_negativos
+            *
+            VALIDATION_SPLIT
+        )
+    )
+)
+
+
+cantidad_val_neg = min(
+    cantidad_val_neg,
+    cantidad_negativos - 1
+)
+
+
+val_samples.extend(
+    negativos[
+        :cantidad_val_neg
+    ]
+)
+
+
+train_samples.extend(
+    negativos[
+        cantidad_val_neg:
+    ]
+)
+
+
+# ============================================================
+# MEZCLAR
+# ============================================================
+
+random.Random(
+    SEED
+).shuffle(
     train_samples
 )
 
-random.Random(SEED).shuffle(
+
+random.Random(
+    SEED
+).shuffle(
     val_samples
 )
 
 
-print("\n==========================================")
+print("\n============================================")
 print("DIVISION DEL DATASET")
-print("==========================================")
+print("============================================")
 
 print(
-    "Entrenamiento:",
-    len(train_samples)
+    f"Entrenamiento: {len(train_samples)}"
 )
 
 print(
-    "Validacion:",
-    len(val_samples)
+    f"Validacion: {len(val_samples)}"
 )
 
 
 # ============================================================
-# SEPARAR RUTAS Y ETIQUETAS
+# SEPARAR RUTAS / ETIQUETAS
 # ============================================================
 
 train_paths = [
-    x[0]
-    for x in train_samples
+    muestra[0]
+    for muestra in train_samples
 ]
+
 
 train_labels = np.array(
     [
-        x[1]
-        for x in train_samples
+        muestra[1]
+        for muestra in train_samples
     ],
     dtype=np.float32
 )
 
 
 val_paths = [
-    x[0]
-    for x in val_samples
+    muestra[0]
+    for muestra in val_samples
 ]
+
 
 val_labels = np.array(
     [
-        x[1]
-        for x in val_samples
+        muestra[1]
+        for muestra in val_samples
     ],
     dtype=np.float32
 )
 
 
 # ============================================================
-# FUNCION PARA CARGAR IMAGEN
+# LECTOR DE IMAGEN ROBUSTO PARA WINDOWS / UNICODE
+# ============================================================
+
+def leer_imagen_numpy(
+    ruta_numpy
+):
+
+    # numpy_function puede entregar numpy.bytes_
+    # o un arreglo escalar.
+
+    if hasattr(
+        ruta_numpy,
+        "item"
+    ):
+
+        ruta_numpy = ruta_numpy.item()
+
+
+    if isinstance(
+        ruta_numpy,
+        bytes
+    ):
+
+        ruta = ruta_numpy.decode(
+            "utf-8"
+        )
+
+    else:
+
+        ruta = str(
+            ruta_numpy
+        )
+
+
+    # --------------------------------------------------------
+    # np.fromfile permite trabajar mejor con nombres Unicode
+    # en Windows, por ejemplo:
+    #
+    # télécharger (5).jpg
+    # --------------------------------------------------------
+
+    datos = np.fromfile(
+        ruta,
+        dtype=np.uint8
+    )
+
+
+    imagen = cv2.imdecode(
+        datos,
+        cv2.IMREAD_COLOR
+    )
+
+
+    if imagen is None:
+
+        raise RuntimeError(
+            f"No se pudo cargar: {ruta}"
+        )
+
+
+    # BGR -> RGB
+
+    imagen = cv2.cvtColor(
+        imagen,
+        cv2.COLOR_BGR2RGB
+    )
+
+
+    # Redimensionar
+
+    imagen = cv2.resize(
+        imagen,
+        (
+            IMG_SIZE[1],
+            IMG_SIZE[0]
+        ),
+        interpolation=cv2.INTER_AREA
+    )
+
+
+    imagen = imagen.astype(
+        np.float32
+    )
+
+
+    imagen = imagen / 255.0
+
+
+    return imagen
+
+
+# ============================================================
+# FUNCION TENSORFLOW PARA CARGAR
 # ============================================================
 
 def cargar_imagen(
@@ -506,32 +884,24 @@ def cargar_imagen(
     etiqueta
 ):
 
-    imagen = tf.io.read_file(
-        ruta
-    )
-
-    imagen = tf.io.decode_image(
-        imagen,
-        channels=3,
-        expand_animations=False
-    )
-
-    imagen.set_shape(
-        [None, None, 3]
-    )
-
-
-    # Convertir a 0-1
-    imagen = tf.image.convert_image_dtype(
-        imagen,
+    imagen = tf.numpy_function(
+        leer_imagen_numpy,
+        [ruta],
         tf.float32
     )
 
 
-    # Resize
-    imagen = tf.image.resize(
-        imagen,
-        IMG_SIZE
+    imagen.set_shape(
+        [
+            IMG_SIZE[0],
+            IMG_SIZE[1],
+            3
+        ]
+    )
+
+
+    etiqueta.set_shape(
+        [NUM_SALIDAS]
     )
 
 
@@ -547,19 +917,19 @@ def aumentar_datos(
     etiqueta
 ):
 
-    # Copiar etiqueta
     etiqueta = tf.identity(
         etiqueta
     )
 
 
     # ========================================================
-    # VOLTEO HORIZONTAL
+    # FLIP HORIZONTAL
     # ========================================================
 
     hacer_flip = (
         tf.random.uniform([])
-        < 0.5
+        <
+        0.5
     )
 
 
@@ -572,22 +942,27 @@ def aumentar_datos(
         )
 
 
-        # Extraer bounding box
+        objectness = etiqueta[4]
+
         x = etiqueta[0]
         y = etiqueta[1]
         w = etiqueta[2]
         h = etiqueta[3]
 
 
-        # Al invertir horizontalmente:
-        #
-        # x_nuevo = 1 - x
-        #
-        # y, w, h permanecen iguales.
+        # Solo modificamos x si realmente
+        # existe un objeto.
 
-        nuevo_bbox = tf.stack(
+        nuevo_x = tf.where(
+            objectness > 0.5,
+            1.0 - x,
+            x
+        )
+
+
+        bbox = tf.stack(
             [
-                1.0 - x,
+                nuevo_x,
                 y,
                 w,
                 h
@@ -597,7 +972,7 @@ def aumentar_datos(
 
         nueva_etiqueta = tf.concat(
             [
-                nuevo_bbox,
+                bbox,
                 etiqueta[4:]
             ],
             axis=0
@@ -610,7 +985,7 @@ def aumentar_datos(
         )
 
 
-    def sin_flip():
+    def no_flip():
 
         return (
             imagen,
@@ -621,7 +996,7 @@ def aumentar_datos(
     imagen, etiqueta = tf.cond(
         hacer_flip,
         aplicar_flip,
-        sin_flip
+        no_flip
     )
 
 
@@ -641,12 +1016,26 @@ def aumentar_datos(
 
     imagen = tf.image.random_contrast(
         imagen,
+        lower=0.80,
+        upper=1.20
+    )
+
+
+    # ========================================================
+    # SATURACION
+    # ========================================================
+
+    imagen = tf.image.random_saturation(
+        imagen,
         lower=0.85,
         upper=1.15
     )
 
 
-    # Mantener valores validos
+    # ========================================================
+    # LIMITAR 0-1
+    # ========================================================
+
     imagen = tf.clip_by_value(
         imagen,
         0.0,
@@ -658,30 +1047,34 @@ def aumentar_datos(
 
 
 # ============================================================
-# CREAR DATASETS TF.DATA
+# CREAR DATASETS
 # ============================================================
 
 AUTOTUNE = tf.data.AUTOTUNE
 
 
-train_ds = tf.data.Dataset.from_tensor_slices(
-    (
-        train_paths,
-        train_labels
+train_ds = (
+    tf.data.Dataset.from_tensor_slices(
+        (
+            train_paths,
+            train_labels
+        )
     )
+)
+
+
+train_ds = train_ds.shuffle(
+    buffer_size=len(
+        train_paths
+    ),
+    seed=SEED,
+    reshuffle_each_iteration=True
 )
 
 
 train_ds = train_ds.map(
     cargar_imagen,
     num_parallel_calls=AUTOTUNE
-)
-
-
-train_ds = train_ds.shuffle(
-    buffer_size=len(train_paths),
-    seed=SEED,
-    reshuffle_each_iteration=True
 )
 
 
@@ -705,10 +1098,12 @@ train_ds = train_ds.prefetch(
 # VALIDACION
 # ============================================================
 
-val_ds = tf.data.Dataset.from_tensor_slices(
-    (
-        val_paths,
-        val_labels
+val_ds = (
+    tf.data.Dataset.from_tensor_slices(
+        (
+            val_paths,
+            val_labels
+        )
     )
 )
 
@@ -730,7 +1125,7 @@ val_ds = val_ds.prefetch(
 
 
 # ============================================================
-# FUNCIONES PARA BOUNDING BOX
+# IoU
 # ============================================================
 
 def calcular_iou(
@@ -738,19 +1133,9 @@ def calcular_iou(
     bbox_pred
 ):
 
-    """
-    Bounding boxes en formato:
-
-    x_centro
-    y_centro
-    ancho
-    alto
-    """
-
-
-    # ========================================================
+    # --------------------------------------------------------
     # REAL
-    # ========================================================
+    # --------------------------------------------------------
 
     xr = bbox_real[:, 0]
     yr = bbox_real[:, 1]
@@ -765,9 +1150,9 @@ def calcular_iou(
     real_y2 = yr + hr / 2.0
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # PREDICHO
-    # ========================================================
+    # --------------------------------------------------------
 
     xp = bbox_pred[:, 0]
     yp = bbox_pred[:, 1]
@@ -782,9 +1167,9 @@ def calcular_iou(
     pred_y2 = yp + hp / 2.0
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # INTERSECCION
-    # ========================================================
+    # --------------------------------------------------------
 
     inter_x1 = tf.maximum(
         real_x1,
@@ -818,49 +1203,65 @@ def calcular_iou(
     )
 
 
-    area_inter = (
-        inter_w * inter_h
+    inter_area = (
+        inter_w
+        *
+        inter_h
     )
 
-
-    # ========================================================
-    # AREAS
-    # ========================================================
 
     area_real = (
-        tf.maximum(wr, 0.0)
+        tf.maximum(
+            wr,
+            0.0
+        )
         *
-        tf.maximum(hr, 0.0)
+        tf.maximum(
+            hr,
+            0.0
+        )
     )
 
+
     area_pred = (
-        tf.maximum(wp, 0.0)
+        tf.maximum(
+            wp,
+            0.0
+        )
         *
-        tf.maximum(hp, 0.0)
+        tf.maximum(
+            hp,
+            0.0
+        )
     )
 
 
     union = (
         area_real
-        + area_pred
-        - area_inter
+        +
+        area_pred
+        -
+        inter_area
     )
 
 
-    iou = area_inter / (
-        union + 1e-7
+    return (
+        inter_area
+        /
+        (
+            union
+            +
+            1e-7
+        )
     )
-
-
-    return iou
 
 
 # ============================================================
-# FUNCION DE PERDIDA
+# FUNCION LOSS
 # ============================================================
 
 @tf.keras.utils.register_keras_serializable(
-    package="Detector"
+    package="DetectorObjectness"
 )
 def detector_loss(
     y_true,
@@ -868,63 +1269,126 @@ def detector_loss(
 ):
 
     # ========================================================
-    # BOUNDING BOX REAL
+    # REAL
     # ========================================================
 
     bbox_real = y_true[
-        :, :4
+        :,
+        0:4
+    ]
+
+
+    objectness_real = y_true[
+        :,
+        4
+    ]
+
+
+    clases_reales = y_true[
+        :,
+        5:
     ]
 
 
     # ========================================================
-    # CLASE REAL
+    # PREDICCION
     # ========================================================
-
-    clase_real = y_true[
-        :, 4:
-    ]
-
-
-    # ========================================================
-    # BOUNDING BOX PREDICHO
-    # ========================================================
-
-    # La salida de Dense es libre.
-    # Sigmoid obliga las coordenadas
-    # a permanecer entre 0 y 1.
 
     bbox_pred = tf.sigmoid(
-        y_pred[:, :4]
+        y_pred[
+            :,
+            0:4
+        ]
     )
 
 
-    # ========================================================
-    # CLASE PREDICHA
-    # ========================================================
+    objectness_logit = y_pred[
+        :,
+        4
+    ]
 
-    logits_clase = y_pred[
-        :, 4:
+
+    class_logits = y_pred[
+        :,
+        5:
     ]
 
 
     # ========================================================
-    # LOSS DE CLASIFICACION
+    # LOSS OBJECTNESS
     # ========================================================
 
-    loss_clase = (
-        tf.keras.losses.categorical_crossentropy(
-            clase_real,
-            logits_clase,
-            from_logits=True
+    loss_obj_individual = (
+        tf.nn.sigmoid_cross_entropy_with_logits(
+            labels=objectness_real,
+            logits=objectness_logit
         )
     )
 
 
+    # Dar mas importancia a los positivos
+
+    pesos_obj = tf.where(
+        objectness_real > 0.5,
+        POSITIVE_OBJECTNESS_WEIGHT,
+        1.0
+    )
+
+
+    loss_objectness = tf.reduce_mean(
+        loss_obj_individual
+        *
+        pesos_obj
+    )
+
+
     # ========================================================
-    # LOSS DE COORDENADAS
+    # MASCARA DE OBJETOS REALES
     # ========================================================
 
-    mse_bbox = tf.reduce_mean(
+    mascara = tf.cast(
+        objectness_real > 0.5,
+        tf.float32
+    )
+
+
+    cantidad_positivos = (
+        tf.reduce_sum(
+            mascara
+        )
+        +
+        1e-7
+    )
+
+
+    # ========================================================
+    # LOSS CLASE
+    # ========================================================
+
+    loss_clase_individual = (
+        tf.nn.softmax_cross_entropy_with_logits(
+            labels=clases_reales,
+            logits=class_logits
+        )
+    )
+
+
+    loss_clase = (
+        tf.reduce_sum(
+            loss_clase_individual
+            *
+            mascara
+        )
+        /
+        cantidad_positivos
+    )
+
+
+    # ========================================================
+    # ERROR COORDENADAS
+    # ========================================================
+
+    error_bbox = tf.reduce_mean(
         tf.square(
             bbox_real
             -
@@ -935,7 +1399,7 @@ def detector_loss(
 
 
     # ========================================================
-    # LOSS IOU
+    # IoU LOSS
     # ========================================================
 
     iou = calcular_iou(
@@ -943,19 +1407,33 @@ def detector_loss(
         bbox_pred
     )
 
+
     loss_iou = (
-        1.0 - iou
+        1.0
+        -
+        iou
     )
 
 
-    # ========================================================
-    # LOSS TOTAL DEL RECUADRO
-    # ========================================================
-
-    loss_bbox = (
-        mse_bbox
+    loss_bbox_individual = (
+        error_bbox
         +
         loss_iou
+    )
+
+
+    # --------------------------------------------------------
+    # SOLO CALCULAR BBOX CUANDO HAY OBJETO
+    # --------------------------------------------------------
+
+    loss_bbox = (
+        tf.reduce_sum(
+            loss_bbox_individual
+            *
+            mascara
+        )
+        /
+        cantidad_positivos
     )
 
 
@@ -964,8 +1442,19 @@ def detector_loss(
     # ========================================================
 
     loss_total = (
-        loss_clase
+
+        OBJECTNESS_LOSS_WEIGHT
+        *
+        loss_objectness
+
         +
+
+        CLASS_LOSS_WEIGHT
+        *
+        loss_clase
+
+        +
+
         BBOX_LOSS_WEIGHT
         *
         loss_bbox
@@ -976,24 +1465,172 @@ def detector_loss(
 
 
 # ============================================================
-# METRICA: PRECISION DE CLASE
+# METRICA OBJECTNESS ACCURACY
 # ============================================================
 
 @tf.keras.utils.register_keras_serializable(
-    package="Detector"
+    package="DetectorObjectness"
+)
+def objectness_accuracy(
+    y_true,
+    y_pred
+):
+
+    real = (
+        y_true[:, 4]
+        >
+        0.5
+    )
+
+
+    pred = (
+        tf.sigmoid(
+            y_pred[:, 4]
+        )
+        >
+        0.5
+    )
+
+
+    return tf.reduce_mean(
+        tf.cast(
+            tf.equal(
+                real,
+                pred
+            ),
+            tf.float32
+        )
+    )
+
+
+# ============================================================
+# OBJECTNESS PRECISION
+# ============================================================
+
+@tf.keras.utils.register_keras_serializable(
+    package="DetectorObjectness"
+)
+def objectness_precision(
+    y_true,
+    y_pred
+):
+
+    real = tf.cast(
+        y_true[:, 4] > 0.5,
+        tf.float32
+    )
+
+
+    pred = tf.cast(
+        tf.sigmoid(
+            y_pred[:, 4]
+        ) > 0.5,
+        tf.float32
+    )
+
+
+    tp = tf.reduce_sum(
+        real * pred
+    )
+
+
+    fp = tf.reduce_sum(
+        (1.0 - real)
+        *
+        pred
+    )
+
+
+    return (
+        tp
+        /
+        (
+            tp
+            +
+            fp
+            +
+            1e-7
+        )
+    )
+
+
+# ============================================================
+# OBJECTNESS RECALL
+# ============================================================
+
+@tf.keras.utils.register_keras_serializable(
+    package="DetectorObjectness"
+)
+def objectness_recall(
+    y_true,
+    y_pred
+):
+
+    real = tf.cast(
+        y_true[:, 4] > 0.5,
+        tf.float32
+    )
+
+
+    pred = tf.cast(
+        tf.sigmoid(
+            y_pred[:, 4]
+        ) > 0.5,
+        tf.float32
+    )
+
+
+    tp = tf.reduce_sum(
+        real * pred
+    )
+
+
+    fn = tf.reduce_sum(
+        real
+        *
+        (1.0 - pred)
+    )
+
+
+    return (
+        tp
+        /
+        (
+            tp
+            +
+            fn
+            +
+            1e-7
+        )
+    )
+
+
+# ============================================================
+# CLASS ACCURACY
+# ============================================================
+
+@tf.keras.utils.register_keras_serializable(
+    package="DetectorObjectness"
 )
 def class_accuracy(
     y_true,
     y_pred
 ):
 
+    mascara = tf.cast(
+        y_true[:, 4] > 0.5,
+        tf.float32
+    )
+
+
     clase_real = tf.argmax(
-        y_true[:, 4:],
+        y_true[:, 5:],
         axis=-1
     )
 
+
     clase_pred = tf.argmax(
-        y_pred[:, 4:],
+        y_pred[:, 5:],
         axis=-1
     )
 
@@ -1007,52 +1644,97 @@ def class_accuracy(
     )
 
 
-    return tf.reduce_mean(
-        correcto
+    return (
+        tf.reduce_sum(
+            correcto
+            *
+            mascara
+        )
+        /
+        (
+            tf.reduce_sum(
+                mascara
+            )
+            +
+            1e-7
+        )
     )
 
 
 # ============================================================
-# METRICA: IoU
+# BBOX IoU
 # ============================================================
 
 @tf.keras.utils.register_keras_serializable(
-    package="Detector"
+    package="DetectorObjectness"
 )
 def bbox_iou(
     y_true,
     y_pred
 ):
 
-    bbox_real = y_true[
-        :, :4
-    ]
-
-    bbox_pred = tf.sigmoid(
-        y_pred[:, :4]
+    mascara = tf.cast(
+        y_true[:, 4] > 0.5,
+        tf.float32
     )
 
 
-    valores_iou = calcular_iou(
+    bbox_real = y_true[
+        :,
+        0:4
+    ]
+
+
+    bbox_pred = tf.sigmoid(
+        y_pred[
+            :,
+            0:4
+        ]
+    )
+
+
+    iou = calcular_iou(
         bbox_real,
         bbox_pred
     )
 
 
-    return tf.reduce_mean(
-        valores_iou
+    return (
+        tf.reduce_sum(
+            iou
+            *
+            mascara
+        )
+        /
+        (
+            tf.reduce_sum(
+                mascara
+            )
+            +
+            1e-7
+        )
     )
 
 
 # ============================================================
-# CREAR RED NEURONAL
 # ============================================================
+#
+# CREAR RED NEURONAL DESDE CERO
+#
+# ============================================================
+# ============================================================
+
+
+print("\n============================================")
+print("CREANDO RED NEURONAL NUEVA")
+print("============================================")
+
 
 # ============================================================
 # CAPA DE ENTRADA
 # ============================================================
 
-entrada = layers.Input(
+entrada = tf.keras.layers.Input(
     shape=(
         IMG_SIZE[0],
         IMG_SIZE[1],
@@ -1061,271 +1743,281 @@ entrada = layers.Input(
     name="CAPA_ENTRADA"
 )
 
+
 x = entrada
 
 
 # ============================================================
 # CAPAS INTERMEDIAS 1 - 6
+# 32 FILTROS
 # ============================================================
 
-# CAPA 1
-x = layers.Conv2D(
-    16,
+# 1
+x = tf.keras.layers.Conv2D(
+    32,
     3,
     strides=2,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_01_conv"
 )(x)
 
 
-# CAPA 2
-x = layers.BatchNormalization(
+# 2
+x = tf.keras.layers.BatchNormalization(
     name="capa_02_batchnorm"
 )(x)
 
 
-# CAPA 3
-x = layers.ReLU(
+# 3
+x = tf.keras.layers.ReLU(
     name="capa_03_relu"
 )(x)
 
 
-# CAPA 4
-x = layers.Conv2D(
-    16,
+# 4
+x = tf.keras.layers.Conv2D(
+    32,
     3,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_04_conv"
 )(x)
 
 
-# CAPA 5
-x = layers.BatchNormalization(
+# 5
+x = tf.keras.layers.BatchNormalization(
     name="capa_05_batchnorm"
 )(x)
 
 
-# CAPA 6
-x = layers.ReLU(
+# 6
+x = tf.keras.layers.ReLU(
     name="capa_06_relu"
 )(x)
 
 
 # ============================================================
-# CAPAS INTERMEDIAS 7 - 12
+# CAPAS 7 - 12
+# 64 FILTROS
 # ============================================================
 
-# CAPA 7
-x = layers.Conv2D(
-    32,
+# 7
+x = tf.keras.layers.Conv2D(
+    64,
     3,
     strides=2,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_07_conv"
 )(x)
 
 
-# CAPA 8
-x = layers.BatchNormalization(
+# 8
+x = tf.keras.layers.BatchNormalization(
     name="capa_08_batchnorm"
 )(x)
 
 
-# CAPA 9
-x = layers.ReLU(
+# 9
+x = tf.keras.layers.ReLU(
     name="capa_09_relu"
 )(x)
 
 
-# CAPA 10
-x = layers.Conv2D(
-    32,
+# 10
+x = tf.keras.layers.Conv2D(
+    64,
     3,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_10_conv"
 )(x)
 
 
-# CAPA 11
-x = layers.BatchNormalization(
+# 11
+x = tf.keras.layers.BatchNormalization(
     name="capa_11_batchnorm"
 )(x)
 
 
-# CAPA 12
-x = layers.ReLU(
+# 12
+x = tf.keras.layers.ReLU(
     name="capa_12_relu"
 )(x)
 
 
 # ============================================================
-# CAPAS INTERMEDIAS 13 - 18
+# CAPAS 13 - 18
+# 128 FILTROS
 # ============================================================
 
-# CAPA 13
-x = layers.Conv2D(
-    64,
+# 13
+x = tf.keras.layers.Conv2D(
+    128,
     3,
     strides=2,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_13_conv"
 )(x)
 
 
-# CAPA 14
-x = layers.BatchNormalization(
+# 14
+x = tf.keras.layers.BatchNormalization(
     name="capa_14_batchnorm"
 )(x)
 
 
-# CAPA 15
-x = layers.ReLU(
+# 15
+x = tf.keras.layers.ReLU(
     name="capa_15_relu"
 )(x)
 
 
-# CAPA 16
-x = layers.Conv2D(
-    64,
+# 16
+x = tf.keras.layers.Conv2D(
+    128,
     3,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_16_conv"
 )(x)
 
 
-# CAPA 17
-x = layers.BatchNormalization(
+# 17
+x = tf.keras.layers.BatchNormalization(
     name="capa_17_batchnorm"
 )(x)
 
 
-# CAPA 18
-x = layers.ReLU(
+# 18
+x = tf.keras.layers.ReLU(
     name="capa_18_relu"
 )(x)
 
 
 # ============================================================
-# CAPAS INTERMEDIAS 19 - 24
+# CAPAS 19 - 24
+# 256 FILTROS
 # ============================================================
 
-# CAPA 19
-x = layers.Conv2D(
-    128,
+# 19
+x = tf.keras.layers.Conv2D(
+    256,
     3,
     strides=2,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_19_conv"
 )(x)
 
 
-# CAPA 20
-x = layers.BatchNormalization(
+# 20
+x = tf.keras.layers.BatchNormalization(
     name="capa_20_batchnorm"
 )(x)
 
 
-# CAPA 21
-x = layers.ReLU(
+# 21
+x = tf.keras.layers.ReLU(
     name="capa_21_relu"
 )(x)
 
 
-# CAPA 22
-x = layers.Conv2D(
-    128,
+# 22
+x = tf.keras.layers.Conv2D(
+    256,
     3,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_22_conv"
 )(x)
 
 
-# CAPA 23
-x = layers.BatchNormalization(
+# 23
+x = tf.keras.layers.BatchNormalization(
     name="capa_23_batchnorm"
 )(x)
 
 
-# CAPA 24
-x = layers.ReLU(
+# 24
+x = tf.keras.layers.ReLU(
     name="capa_24_relu"
 )(x)
 
 
 # ============================================================
-# CAPAS INTERMEDIAS 25 - 30
+# CAPAS 25 - 30
+# 384 FILTROS
 # ============================================================
 
-# CAPA 25
-x = layers.Conv2D(
-    256,
+# 25
+x = tf.keras.layers.Conv2D(
+    384,
     3,
     strides=2,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_25_conv"
 )(x)
 
 
-# CAPA 26
-x = layers.BatchNormalization(
+# 26
+x = tf.keras.layers.BatchNormalization(
     name="capa_26_batchnorm"
 )(x)
 
 
-# CAPA 27
-x = layers.ReLU(
+# 27
+x = tf.keras.layers.ReLU(
     name="capa_27_relu"
 )(x)
 
 
-# CAPA 28
-x = layers.Conv2D(
-    256,
+# 28
+x = tf.keras.layers.Conv2D(
+    384,
     3,
     padding="same",
     kernel_regularizer=tf.keras.regularizers.l2(
-        0.0001
+        0.00001
     ),
     name="capa_28_conv"
 )(x)
 
 
-# CAPA 29
-x = layers.ReLU(
+# 29
+x = tf.keras.layers.ReLU(
     name="capa_29_relu"
 )(x)
 
 
-# CAPA 30
-x = layers.GlobalAveragePooling2D(
-    name="capa_30_global_average"
+# 30
+#
+# Flatten conserva mejor la informacion espacial
+# para poder aprender x, y, w, h.
+
+x = tf.keras.layers.Flatten(
+    name="capa_30_flatten"
 )(x)
 
 
@@ -1333,15 +2025,7 @@ x = layers.GlobalAveragePooling2D(
 # CAPA DE SALIDA
 # ============================================================
 
-# Para 3 clases:
-#
-# 4 coordenadas
-# +
-# 3 clases
-# =
-# 7 salidas
-
-salida = layers.Dense(
+salida = tf.keras.layers.Dense(
     NUM_SALIDAS,
     activation=None,
     name="CAPA_SALIDA"
@@ -1352,65 +2036,88 @@ salida = layers.Dense(
 # CREAR MODELO
 # ============================================================
 
-model = Model(
+model = tf.keras.Model(
     inputs=entrada,
     outputs=salida,
-    name="Detector_Objetos_30_Capas"
+    name="Detector_Objectness_30_Capas"
 )
 
 
 # ============================================================
-# COMPROBAR ARQUITECTURA
+# COMPROBAR NUMERO DE CAPAS
 # ============================================================
-
-print("\n==========================================")
-print("ARQUITECTURA")
-print("==========================================\n")
-
 
 model.summary()
 
 
-numero_total = len(
-    model.layers
-)
+print("\n============================================")
+print("COMPROBACION DE ARQUITECTURA")
+print("============================================")
 
-numero_intermedias = (
-    numero_total - 2
-)
-
-
-print("\n==========================================")
-print("COMPROBACION DE CAPAS")
-print("==========================================")
 
 print(
-    "Capas totales:",
-    numero_total
+    f"Capas totales: {len(model.layers)}"
+)
+
+
+print(
+    f"Capas intermedias: "
+    f"{len(model.layers) - 2}"
+)
+
+
+print(
+    f"Salidas: "
+    f"{model.output_shape[-1]}"
+)
+
+
+print(
+    f"Salidas esperadas: "
+    f"{NUM_SALIDAS}"
+)
+
+
+if len(model.layers) != 32:
+
+    raise RuntimeError(
+        "ERROR: La red no tiene "
+        "1 entrada + 30 intermedias + 1 salida."
+    )
+
+
+if model.output_shape[-1] != NUM_SALIDAS:
+
+    raise RuntimeError(
+        "ERROR en el numero de salidas."
+    )
+
+
+print("\nCORRECTO:")
+print(
+    "1 capa de entrada"
 )
 
 print(
-    "Capas intermedias:",
-    numero_intermedias
+    "30 capas intermedias"
+)
+
+print(
+    "1 capa de salida"
 )
 
 
-if numero_total == 32:
+print("\nFormato de salida:")
 
-    print("\nCORRECTO:")
-
-    print(
-        "1 entrada + "
-        "30 intermedias + "
-        "1 salida"
+print(
+    "[x, y, w, h, objectness, "
+    +
+    ", ".join(
+        CLASS_NAMES
     )
-
-else:
-
-    print(
-        "\nADVERTENCIA: "
-        "El modelo no tiene 32 capas."
-    )
+    +
+    "]"
+)
 
 
 # ============================================================
@@ -1420,12 +2127,15 @@ else:
 model.compile(
 
     optimizer=tf.keras.optimizers.Adam(
-        learning_rate=0.0001
+        learning_rate=LEARNING_RATE
     ),
 
     loss=detector_loss,
 
     metrics=[
+        objectness_accuracy,
+        objectness_precision,
+        objectness_recall,
         class_accuracy,
         bbox_iou
     ]
@@ -1438,35 +2148,90 @@ model.compile(
 
 callbacks = [
 
-    # Guarda el mejor modelo encontrado
+    # --------------------------------------------------------
+    # GUARDAR MEJOR MODELO
+    # --------------------------------------------------------
+
     tf.keras.callbacks.ModelCheckpoint(
-        "mejor_detector.keras",
+
+        MEJOR_MODELO,
+
         monitor="val_loss",
+
         save_best_only=True,
+
         mode="min",
+
         verbose=1
     ),
 
-    # Baja automáticamente el learning rate
-    # cuando el modelo deja de mejorar
+
+    # --------------------------------------------------------
+    # BAJAR LEARNING RATE SI SE ESTANCA
+    # --------------------------------------------------------
+    #
+    # NO detiene las 150 epocas.
+    # --------------------------------------------------------
+
     tf.keras.callbacks.ReduceLROnPlateau(
+
         monitor="val_loss",
+
         factor=0.5,
-        patience=7,
+
+        patience=8,
+
         min_lr=0.0000001,
+
         verbose=1
     ),
 
-    # Detiene solamente si aparece NaN
+
+    # --------------------------------------------------------
+    # GUARDAR HISTORIAL
+    # --------------------------------------------------------
+
+    tf.keras.callbacks.CSVLogger(
+        HISTORIAL_CSV,
+        append=False
+    ),
+
+
+    # --------------------------------------------------------
+    # SOLO DETENER SI HAY NaN
+    # --------------------------------------------------------
+
     tf.keras.callbacks.TerminateOnNaN()
 ]
+
+
 # ============================================================
 # ENTRENAR
 # ============================================================
 
-print("\n==========================================")
-print("INICIANDO ENTRENAMIENTO")
-print("==========================================\n")
+print("\n============================================")
+print("INICIANDO ENTRENAMIENTO DESDE CERO")
+print("============================================")
+
+print(
+    f"\nEpocas: {EPOCHS}"
+)
+
+print(
+    f"Batch: {BATCH_SIZE}"
+)
+
+print(
+    f"Learning rate inicial: {LEARNING_RATE}"
+)
+
+print(
+    f"Entrenamiento: {len(train_samples)} imagenes"
+)
+
+print(
+    f"Validacion: {len(val_samples)} imagenes"
+)
 
 
 history = model.fit(
@@ -1477,31 +2242,34 @@ history = model.fit(
 
     epochs=EPOCHS,
 
-    callbacks=callbacks
-)
+    callbacks=callbacks,
 
-
-# ============================================================
-# EVALUAR MODELO
-# ============================================================
-
-print("\n==========================================")
-print("EVALUACION FINAL")
-print("==========================================\n")
-
-
-resultados = model.evaluate(
-    val_ds,
     verbose=1
 )
 
 
-print("\nResultados:")
+# ============================================================
+# EVALUAR
+# ============================================================
 
-for nombre, valor in zip(
-    model.metrics_names,
-    resultados
-):
+print("\n============================================")
+print("EVALUACION FINAL")
+print("============================================")
+
+
+resultados = model.evaluate(
+    val_ds,
+    verbose=1,
+    return_dict=True
+)
+
+
+print("\n============================================")
+print("RESULTADOS")
+print("============================================")
+
+
+for nombre, valor in resultados.items():
 
     print(
         f"{nombre}: {valor:.4f}"
@@ -1509,55 +2277,90 @@ for nombre, valor in zip(
 
 
 # ============================================================
-# GUARDAR MODELO FINAL
+# MOSTRAR RESULTADOS EN PORCENTAJE
+# ============================================================
+
+if "objectness_accuracy" in resultados:
+
+    print(
+        "\nObjectness accuracy: "
+        f"{resultados['objectness_accuracy'] * 100:.2f}%"
+    )
+
+
+if "objectness_precision" in resultados:
+
+    print(
+        "Objectness precision: "
+        f"{resultados['objectness_precision'] * 100:.2f}%"
+    )
+
+
+if "objectness_recall" in resultados:
+
+    print(
+        "Objectness recall: "
+        f"{resultados['objectness_recall'] * 100:.2f}%"
+    )
+
+
+if "class_accuracy" in resultados:
+
+    print(
+        "Precision de clasificacion: "
+        f"{resultados['class_accuracy'] * 100:.2f}%"
+    )
+
+
+if "bbox_iou" in resultados:
+
+    print(
+        "IoU del bounding box: "
+        f"{resultados['bbox_iou'] * 100:.2f}%"
+    )
+
+
+print(
+    f"\nLoss final: "
+    f"{resultados['loss']:.4f}"
+)
+
+
+# ============================================================
+# GUARDAR MODELO DE LA ULTIMA EPOCA
 # ============================================================
 
 model.save(
-    "modelo_detector_30_capas.keras"
+    MODELO_FINAL
 )
 
 
-print("\n==========================================")
+print("\n============================================")
 print("ENTRENAMIENTO TERMINADO")
-print("==========================================")
+print("============================================")
+
 
 print(
-    "\nModelo final:"
-)
-
-print(
-    "modelo_detector_30_capas.keras"
-)
-
-print(
-    "\nMejor modelo:"
-)
-
-print(
-    "mejor_detector.keras"
+    f"\nMejor modelo:\n{MEJOR_MODELO}"
 )
 
 
-# ============================================================
-# MOSTRAR SIGNIFICADO DE LA SALIDA
-# ============================================================
+print(
+    f"\nModelo ultima epoca:\n{MODELO_FINAL}"
+)
 
-print("\nLa salida de la red es:")
 
 print(
-    "[x, y, w, h, "
-    + ", ".join(class_names)
-    + "]"
+    f"\nHistorial:\n{HISTORIAL_CSV}"
+)
+
+
+print("\nIMPORTANTE:")
+
+print(
+    "Para reconocer.py utiliza:"
 )
 
 print(
-    "\nLas primeras 4 salidas son "
-    "logits que reconocer.py convertira "
-    "con sigmoid."
-)
-
-print(
-    "Las salidas restantes son logits "
-    "de las clases y reconocer.py "
-    "convertira con softmax."
+    MEJOR_MODELO
 )

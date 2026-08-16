@@ -1,28 +1,40 @@
 import cv2
 import numpy as np
 import tensorflow as tf
+from collections import deque
 
 # ============================================================
 # CONFIGURACION
 # ============================================================
 
-MODELO = "mejor_detector.keras"
+MODELO = "mejor_detector_objectness.keras"
 ARCHIVO_CLASES = "clases.txt"
 
 IMG_SIZE = (224, 224)
 
-# Confianza minima para mostrar deteccion
-CONFIANZA_MINIMA = 0.80
+# ------------------------------------------------------------
+# UMBRALES
+# ------------------------------------------------------------
+
+# Que tan seguro debe estar de que realmente existe
+# uno de nuestros objetos
+OBJECTNESS_MINIMA = 0.80
+
+# Que tan seguro debe estar de que clase es
+CONFIANZA_CLASE_MINIMA = 0.60
+
+# Frames utilizados para suavizar la deteccion
+HISTORIAL = 5
 
 
 # ============================================================
 # CARGAR MODELO
 # ============================================================
 
-print("Cargando modelo...")
+print("\n============================================")
+print("CARGANDO MODELO")
+print("============================================")
 
-# compile=False porque para reconocer no necesitamos
-# detector_loss, class_accuracy ni bbox_iou
 model = tf.keras.models.load_model(
     MODELO,
     compile=False
@@ -48,10 +60,71 @@ with open(
     ]
 
 
-print("\nClases cargadas:")
+print("\nClases:")
 
 for i, clase in enumerate(class_names):
     print(f"{i} -> {clase}")
+
+
+# ============================================================
+# COMPROBAR SALIDA DEL MODELO
+# ============================================================
+
+numero_salidas = model.output_shape[-1]
+
+salidas_esperadas = (
+    5 + len(class_names)
+)
+
+
+print("\nSalidas del modelo:", numero_salidas)
+print("Salidas esperadas:", salidas_esperadas)
+
+
+if numero_salidas != salidas_esperadas:
+
+    print("\nERROR:")
+
+    print(
+        "El numero de salidas del modelo "
+        "no coincide con reconocer.py."
+    )
+
+    print("\nFormato esperado:")
+
+    print(
+        "[x, y, w, h, objectness, "
+        + ", ".join(class_names)
+        + "]"
+    )
+
+    exit()
+
+
+print("\nFormato correcto:")
+
+print(
+    "[x, y, w, h, objectness, "
+    + ", ".join(class_names)
+    + "]"
+)
+
+
+# ============================================================
+# HISTORIALES PARA SUAVIZADO
+# ============================================================
+
+historial_objectness = deque(
+    maxlen=HISTORIAL
+)
+
+historial_probabilidades = deque(
+    maxlen=HISTORIAL
+)
+
+historial_bbox = deque(
+    maxlen=HISTORIAL
+)
 
 
 # ============================================================
@@ -60,14 +133,33 @@ for i, clase in enumerate(class_names):
 
 camara = cv2.VideoCapture(0)
 
+
 if not camara.isOpened():
 
-    print("ERROR: No se pudo abrir la camara.")
+    print(
+        "ERROR: No se pudo abrir la camara."
+    )
+
     exit()
 
 
-print("\nCamara iniciada.")
-print("Presiona Q para salir.\n")
+# Intentar resolución 1280x720
+camara.set(
+    cv2.CAP_PROP_FRAME_WIDTH,
+    1280
+)
+
+camara.set(
+    cv2.CAP_PROP_FRAME_HEIGHT,
+    720
+)
+
+
+print("\n============================================")
+print("CAMARA INICIADA")
+print("============================================")
+
+print("\nPresiona Q para salir.")
 
 
 # ============================================================
@@ -78,59 +170,52 @@ while True:
 
     ret, frame = camara.read()
 
+
     if not ret:
 
         print(
-            "No se pudo obtener imagen de la camara."
+            "No se pudo obtener imagen."
         )
 
         break
 
 
     # ========================================================
-    # TAMAÑO ORIGINAL DEL FRAME
+    # DIMENSIONES DEL FRAME
     # ========================================================
 
     alto_frame, ancho_frame = frame.shape[:2]
 
 
     # ========================================================
-    # PREPARAR IMAGEN
+    # PREPARAR IMAGEN PARA LA RED
     # ========================================================
 
-    # OpenCV trabaja en BGR
-    # TensorFlow fue entrenado con RGB
+    # BGR -> RGB
     imagen_rgb = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2RGB
     )
 
 
-    # Cambiar a 224x224
+    # Resize
     imagen = cv2.resize(
         imagen_rgb,
         IMG_SIZE
     )
 
 
-    # Convertir a float
+    # Float32
     imagen = imagen.astype(
         np.float32
     )
 
 
-    # Normalizar 0-255 -> 0-1
+    # Normalizacion
     imagen = imagen / 255.0
 
 
-    # Agregar dimension batch
-    #
-    # (224,224,3)
-    #
-    # pasa a:
-    #
-    # (1,224,224,3)
-
+    # Agregar batch
     imagen = np.expand_dims(
         imagen,
         axis=0
@@ -138,7 +223,7 @@ while True:
 
 
     # ========================================================
-    # HACER PREDICCION
+    # PREDICCION
     # ========================================================
 
     prediccion = model.predict(
@@ -148,56 +233,106 @@ while True:
 
 
     # ========================================================
-    # COORDENADAS
+    # BOUNDING BOX
+    # ========================================================
+    #
+    # 0 = x centro
+    # 1 = y centro
+    # 2 = ancho
+    # 3 = alto
+    #
+    # Durante entrenamiento estas salidas son logits,
+    # por eso utilizamos sigmoid.
     # ========================================================
 
-    # Primeros 4 valores:
-    #
-    # x
-    # y
-    # w
-    # h
-    #
-    # Son logits, por eso aplicamos sigmoid.
+    bbox_logits = prediccion[
+        0:4
+    ]
 
-    bbox_logits = prediccion[:4]
 
     bbox = tf.sigmoid(
         bbox_logits
     ).numpy()
 
 
-    x_centro = float(bbox[0])
-    y_centro = float(bbox[1])
+    # ========================================================
+    # OBJECTNESS
+    # ========================================================
 
-    ancho_bbox = float(bbox[2])
-    alto_bbox = float(bbox[3])
+    objectness_logit = prediccion[4]
+
+
+    objectness = float(
+        tf.sigmoid(
+            objectness_logit
+        ).numpy()
+    )
 
 
     # ========================================================
     # CLASIFICACION
     # ========================================================
 
-    # El resto de valores son las clases
-    class_logits = prediccion[4:]
+    class_logits = prediccion[
+        5:
+    ]
 
 
-    # Convertir logits a probabilidades
     probabilidades = tf.nn.softmax(
         class_logits
     ).numpy()
 
 
-    # Clase con mayor probabilidad
-    indice = int(
-        np.argmax(
-            probabilidades
+    # ========================================================
+    # GUARDAR RESULTADOS EN HISTORIAL
+    # ========================================================
+
+    historial_objectness.append(
+        objectness
+    )
+
+
+    historial_probabilidades.append(
+        probabilidades
+    )
+
+
+    historial_bbox.append(
+        bbox
+    )
+
+
+    # ========================================================
+    # PROMEDIAR ULTIMOS FRAMES
+    # ========================================================
+
+    objectness_promedio = float(
+        np.mean(
+            historial_objectness
         )
     )
 
 
-    confianza = float(
-        probabilidades[indice]
+    probabilidades_promedio = np.mean(
+        historial_probabilidades,
+        axis=0
+    )
+
+
+    bbox_promedio = np.mean(
+        historial_bbox,
+        axis=0
+    )
+
+
+    # ========================================================
+    # OBTENER CLASE GANADORA
+    # ========================================================
+
+    indice = int(
+        np.argmax(
+            probabilidades_promedio
+        )
     )
 
 
@@ -206,66 +341,100 @@ while True:
     ]
 
 
-    # ========================================================
-    # CONVERTIR BBOX A PIXELES
-    # ========================================================
-
-    # Formato del modelo:
-    #
-    # x centro
-    # y centro
-    # ancho
-    # alto
-    #
-    # valores entre 0 y 1
-
-
-    centro_x_px = int(
-        x_centro * ancho_frame
+    confianza = float(
+        probabilidades_promedio[
+            indice
+        ]
     )
 
+
+    # ========================================================
+    # BBOX PROMEDIO
+    # ========================================================
+
+    x_centro = float(
+        bbox_promedio[0]
+    )
+
+    y_centro = float(
+        bbox_promedio[1]
+    )
+
+    ancho_bbox = float(
+        bbox_promedio[2]
+    )
+
+    alto_bbox = float(
+        bbox_promedio[3]
+    )
+
+
+    # ========================================================
+    # CONVERTIR COORDENADAS NORMALIZADAS A PIXELES
+    # ========================================================
+
+    centro_x_px = int(
+        x_centro
+        *
+        ancho_frame
+    )
+
+
     centro_y_px = int(
-        y_centro * alto_frame
+        y_centro
+        *
+        alto_frame
     )
 
 
     ancho_px = int(
-        ancho_bbox * ancho_frame
+        ancho_bbox
+        *
+        ancho_frame
     )
 
+
     alto_px = int(
-        alto_bbox * alto_frame
+        alto_bbox
+        *
+        alto_frame
     )
 
 
     # ========================================================
-    # CALCULAR ESQUINAS
+    # ESQUINAS DEL RECTANGULO
     # ========================================================
 
     x1 = int(
-        centro_x_px -
+        centro_x_px
+        -
         ancho_px / 2
     )
 
+
     y1 = int(
-        centro_y_px -
+        centro_y_px
+        -
         alto_px / 2
     )
 
 
     x2 = int(
-        centro_x_px +
+        centro_x_px
+        +
         ancho_px / 2
     )
 
+
     y2 = int(
-        centro_y_px +
+        centro_y_px
+        +
         alto_px / 2
     )
 
 
     # ========================================================
-    # EVITAR QUE EL CUADRO SALGA DE LA IMAGEN
+    # LIMITAR RECTANGULO AL FRAME
     # ========================================================
 
     x1 = max(
@@ -276,6 +445,7 @@ while True:
         )
     )
 
+
     y1 = max(
         0,
         min(
@@ -284,6 +454,7 @@ while True:
         )
     )
 
+
     x2 = max(
         0,
         min(
@@ -291,6 +462,7 @@ while True:
             ancho_frame - 1
         )
     )
+
 
     y2 = max(
         0,
@@ -302,13 +474,39 @@ while True:
 
 
     # ========================================================
-    # MOSTRAR DETECCION
+    # DECISION FINAL
+    # ========================================================
+    #
+    # Para dibujar algo se deben cumplir DOS condiciones:
+    #
+    # 1. La red cree que realmente hay un objeto conocido.
+    #
+    # 2. La red tiene suficiente confianza en la clase.
+    #
     # ========================================================
 
-    if confianza >= CONFIANZA_MINIMA:
+    objeto_detectado = (
+
+        objectness_promedio
+        >=
+        OBJECTNESS_MINIMA
+
+        and
+
+        confianza
+        >=
+        CONFIANZA_CLASE_MINIMA
+    )
+
+
+    # ========================================================
+    # DIBUJAR DETECCION
+    # ========================================================
+
+    if objeto_detectado:
 
         # ----------------------------------------------------
-        # DIBUJAR RECUADRO
+        # RECTANGULO
         # ----------------------------------------------------
 
         cv2.rectangle(
@@ -321,7 +519,7 @@ while True:
 
 
         # ----------------------------------------------------
-        # TEXTO DE ETIQUETA
+        # ETIQUETA
         # ----------------------------------------------------
 
         etiqueta = (
@@ -330,7 +528,6 @@ while True:
         )
 
 
-        # Obtener tamaño del texto
         (
             ancho_texto,
             alto_texto
@@ -346,26 +543,33 @@ while True:
         )
 
 
-        # ====================================================
-        # POSICION DEL TEXTO
-        # ====================================================
+        # ----------------------------------------------------
+        # POSICION TEXTO
+        # ----------------------------------------------------
 
         texto_y = y1 - 10
 
 
-        # Si no cabe arriba
-        if texto_y - alto_texto < 0:
+        if (
+            texto_y
+            -
+            alto_texto
+            <
+            0
+        ):
 
             texto_y = (
-                y1 +
-                alto_texto +
+                y1
+                +
+                alto_texto
+                +
                 15
             )
 
 
-        # ====================================================
-        # FONDO DE LA ETIQUETA
-        # ====================================================
+        # ----------------------------------------------------
+        # FONDO ETIQUETA
+        # ----------------------------------------------------
 
         cv2.rectangle(
 
@@ -374,17 +578,22 @@ while True:
             (
                 x1,
                 texto_y
-                - alto_texto
-                - 10
+                -
+                alto_texto
+                -
+                10
             ),
 
             (
                 x1
-                + ancho_texto
-                + 10,
+                +
+                ancho_texto
+                +
+                10,
 
                 texto_y
-                + baseline
+                +
+                baseline
             ),
 
             (0, 0, 0),
@@ -393,9 +602,9 @@ while True:
         )
 
 
-        # ====================================================
-        # ESCRIBIR ETIQUETA
-        # ====================================================
+        # ----------------------------------------------------
+        # TEXTO
+        # ----------------------------------------------------
 
         cv2.putText(
 
@@ -419,27 +628,39 @@ while True:
 
 
         estado = (
-            f"Detectado: {clase}"
+            f"DETECTADO: {clase}"
         )
 
 
     else:
 
         estado = (
-            "Objeto no reconocido"
+            "NINGUN OBJETO CONOCIDO"
         )
 
 
     # ========================================================
-    # MOSTRAR ESTADO GENERAL
+    # PANEL SUPERIOR
     # ========================================================
 
     cv2.rectangle(
         frame,
         (0, 0),
-        (ancho_frame, 55),
+        (ancho_frame, 200),
         (0, 0, 0),
         -1
+    )
+
+
+    # ========================================================
+    # ESTADO
+    # ========================================================
+
+    color_estado = (
+        (0, 255, 0)
+        if objeto_detectado
+        else
+        (0, 0, 255)
     )
 
 
@@ -455,17 +676,46 @@ while True:
 
         0.8,
 
-        (0, 255, 0),
+        color_estado,
 
         2
     )
 
 
     # ========================================================
-    # MOSTRAR PROBABILIDADES
+    # OBJECTNESS
     # ========================================================
 
-    y_texto = 85
+    texto_objectness = (
+        f"Objectness: "
+        f"{objectness_promedio * 100:.1f}% "
+        f"(min {OBJECTNESS_MINIMA * 100:.0f}%)"
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        texto_objectness,
+
+        (20, 70),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.6,
+
+        (0, 255, 255),
+
+        2
+    )
+
+
+    # ========================================================
+    # PROBABILIDADES
+    # ========================================================
+
+    y_texto = 105
 
 
     for i, nombre in enumerate(
@@ -473,8 +723,9 @@ while True:
     ):
 
         porcentaje = (
-            probabilidades[i]
-            * 100
+            probabilidades_promedio[i]
+            *
+            100
         )
 
 
@@ -484,19 +735,40 @@ while True:
         )
 
 
+        # Resaltar clase ganadora
+        if i == indice:
+
+            color = (
+                0,
+                255,
+                0
+            )
+
+        else:
+
+            color = (
+                255,
+                255,
+                255
+            )
+
+
         cv2.putText(
 
             frame,
 
             texto,
 
-            (20, y_texto),
+            (
+                20,
+                y_texto
+            ),
 
             cv2.FONT_HERSHEY_SIMPLEX,
 
             0.55,
 
-            (255, 255, 255),
+            color,
 
             2
         )
@@ -506,11 +778,40 @@ while True:
 
 
     # ========================================================
-    # DEBUG DE BOUNDING BOX
+    # MOSTRAR CONFIANZA MINIMA
+    # ========================================================
+
+    cv2.putText(
+
+        frame,
+
+        (
+            f"Confianza clase minima: "
+            f"{CONFIANZA_CLASE_MINIMA * 100:.0f}%"
+        ),
+
+        (
+            300,
+            70
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.55,
+
+        (255, 255, 255),
+
+        1
+    )
+
+
+    # ========================================================
+    # MOSTRAR BBOX PARA DEBUG
     # ========================================================
 
     texto_bbox = (
 
+        f"BBOX "
         f"x:{x_centro:.2f} "
         f"y:{y_centro:.2f} "
         f"w:{ancho_bbox:.2f} "
@@ -540,11 +841,11 @@ while True:
 
 
     # ========================================================
-    # MOSTRAR CAMARA
+    # MOSTRAR FRAME
     # ========================================================
 
     cv2.imshow(
-        "Detector de objetos",
+        "Detector de objetos - Objectness",
         frame
     )
 
@@ -553,7 +854,11 @@ while True:
     # SALIR
     # ========================================================
 
-    tecla = cv2.waitKey(1) & 0xFF
+    tecla = (
+        cv2.waitKey(1)
+        &
+        0xFF
+    )
 
 
     if tecla == ord("q"):
@@ -568,4 +873,7 @@ camara.release()
 
 cv2.destroyAllWindows()
 
-print("\nPrograma finalizado.")
+
+print("\n============================================")
+print("PROGRAMA FINALIZADO")
+print("============================================")

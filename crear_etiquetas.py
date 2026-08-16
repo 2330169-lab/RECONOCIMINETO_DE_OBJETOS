@@ -1,5 +1,6 @@
 import cv2
 import os
+import numpy as np
 from pathlib import Path
 
 # ============================================================
@@ -13,7 +14,8 @@ DATASET_DIR = "dataset"
 CLASES = {
     "Bolsas": 0,
     "Peluches": 1,
-    "Perfume": 2
+    "Perfume": 2,
+    "no_objeto": 3
 }
 
 # Tamaño maximo de la imagen mostrada en pantalla
@@ -267,6 +269,7 @@ for numero, datos in enumerate(
 
     imagen_original = cv2.imread(
         str(ruta_imagen)
+        
     )
 
     if imagen_original is None:
